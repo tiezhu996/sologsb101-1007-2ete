@@ -29,13 +29,15 @@ import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
-import { formatRate, formatReading, ratioOf } from '@/utils/threshold'
+import { formatRate, formatReading, isFutureDate, latestEffectiveObservation, ratioOf } from '@/utils/threshold'
 
 interface TrendRow {
   point: Point
   damName: string
   stakeNo: string
   latest: ObservationRow | null
+  /** 截至今天（含）的最新观测：当前预警判定与预警单生成只认它，未来日期的记录不参与 */
+  latestEffective: ObservationRow | null
   count: number
   cumulative: number
   dailyRate: number
@@ -94,6 +96,7 @@ export default function TrendBoard() {
           .filter((row) => row.pointId === point.id)
           .sort((a, b) => a.date.localeCompare(b.date))
         const latest = own[own.length - 1] ?? null
+        const latestEffective = latestEffectiveObservation(own)
         const section = damStore.sections.find((item) => item.id === point.sectionId)
         const dam = damStore.dams.find((item) => item.id === point.damId)
         const cumulative = latest ? latest.cumulative : 0
@@ -102,6 +105,7 @@ export default function TrendBoard() {
           damName: dam ? dam.name : '—',
           stakeNo: section ? section.stakeNo : '—',
           latest,
+          latestEffective,
           count: own.length,
           cumulative,
           dailyRate: latest ? latest.dailyRate : 0,
@@ -128,9 +132,16 @@ export default function TrendBoard() {
     [observationTable.rows, drawerPointId]
   )
   const drawerLatest = drawerObservations[0] ?? null
-  const drawerLevel = drawerPoint && drawerLatest ? alarmLevel.evaluate(drawerPoint, drawerLatest.reading).level : null
+  /** 抽屉内当前预警口径：只认截至今天的有效观测，未来日期的记录不进入当前预警 */
+  const drawerEffective = useMemo(() => latestEffectiveObservation(drawerObservations), [drawerObservations])
+  const drawerLevel =
+    drawerPoint && drawerEffective ? alarmLevel.evaluate(drawerPoint, drawerEffective.reading).level : null
 
   const generateAlarm = async (point: Point, observation: ObservationRow): Promise<void> => {
+    if (isFutureDate(observation.date)) {
+      message.warning('未来日期的观测仅存档，不进入当前预警')
+      return
+    }
     if (alarmStore.alarms.some((alarm) => alarm.pointId === point.id && alarm.triggerDate === observation.date)) {
       message.info('该测点当日已生成预警单')
       return
@@ -209,31 +220,40 @@ export default function TrendBoard() {
     },
     {
       title: '判定',
-      width: 150,
+      width: 200,
       render: (_value, record) => {
-        if (!record.latest) return <Tag>暂无观测</Tag>
-        const level = alarmLevel.evaluate(record.point, record.latest.reading).level
-        return level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>
+        if (!record.latestEffective) return <Tag>暂无观测</Tag>
+        const level = alarmLevel.evaluate(record.point, record.latestEffective.reading).level
+        return (
+          <Space size={4}>
+            {level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>}
+            {record.latest && isFutureDate(record.latest.date) ? <Tag>未来观测不入预警</Tag> : null}
+          </Space>
+        )
       }
     },
     {
       title: '操作',
       width: 170,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button type="link" size="small" onClick={() => setDrawerPointId(record.point.id)}>
-            曲线
-          </Button>
-          <Button
-            type="link"
-            size="small"
-            disabled={!record.latest || record.ratio < 0.7}
-            onClick={() => record.latest && generateAlarm(record.point, record.latest)}
-          >
-            生成预警
-          </Button>
-        </Space>
-      )
+      render: (_value, record) => {
+        // 生成预警只认截至今天的有效观测；未来日期的记录可保存但不进入当前预警
+        const effectiveRatio = record.latestEffective ? ratioOf(record.latestEffective.cumulative, record.point.threshold) : 0
+        return (
+          <Space size={4}>
+            <Button type="link" size="small" onClick={() => setDrawerPointId(record.point.id)}>
+              曲线
+            </Button>
+            <Button
+              type="link"
+              size="small"
+              disabled={!record.latestEffective || effectiveRatio < 0.7}
+              onClick={() => record.latestEffective && generateAlarm(record.point, record.latestEffective)}
+            >
+              生成预警
+            </Button>
+          </Space>
+        )
+      }
     }
   ]
 
@@ -316,17 +336,18 @@ export default function TrendBoard() {
                 {drawerLevel ? <AlarmTag level={drawerLevel} size="small" /> : <Tag color="green">正常</Tag>}
               </Descriptions.Item>
             </Descriptions>
-            <div style={{ margin: '14px 0', display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {drawerLatest ? (
+            <div style={{ margin: '14px 0', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+              {drawerEffective ? (
                 <Button
                   type="primary"
                   size="small"
                   disabled={!drawerLevel}
-                  onClick={() => generateAlarm(drawerPoint, drawerLatest)}
+                  onClick={() => generateAlarm(drawerPoint, drawerEffective)}
                 >
                   按最新观测生成预警单
                 </Button>
               ) : null}
+              {drawerLatest && isFutureDate(drawerLatest.date) ? <Tag>含未来日期观测，不进入当前预警</Tag> : null}
               <Button size="small" onClick={() => openThreshold(drawerPoint)}>
                 编辑初值与阈值
               </Button>

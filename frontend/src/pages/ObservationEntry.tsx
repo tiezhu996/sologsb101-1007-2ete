@@ -15,7 +15,8 @@ import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, putObservation, type ObservationRow } from '@/utils/db'
+import { db, deleteObservation, putObservation, type ObservationRow } from '@/utils/db'
+import { isFutureDate, latestEffectiveObservation, todayString } from '@/utils/threshold'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
 import type { ObservationDraft } from '@/types/observation'
 
@@ -80,6 +81,8 @@ export default function ObservationEntry() {
     activePoint && typeof draftReading === 'number'
       ? alarmLevel.evaluate(activePoint, draftReading)
       : null
+  /** 未来日期仅存档：预览照常提示级别，但不允许生成预警单 */
+  const draftIsFuture = typeof draftDate === 'string' && draftDate.length > 0 && isFutureDate(draftDate)
 
   const openCreate = (): void => {
     if (!activePoint) {
@@ -90,7 +93,7 @@ export default function ObservationEntry() {
     const latest = observationsOfActive[0]
     form.setFieldsValue({
       pointId: activePoint.id,
-      date: new Date().toISOString().slice(0, 10),
+      date: todayString(),
       reading: latest ? latest.reading : activePoint.initialValue,
       observer: ''
     })
@@ -119,7 +122,9 @@ export default function ObservationEntry() {
     }
     const now = Date.now()
     try {
-      await putObservation({
+      // 同一测点同一日期只保留一条：putObservation 内部按 测点+日期 查重，已有记录则沿用更正，
+      // 并联动重算该测点后续日期的累计与日速率
+      const result = await putObservation({
         id: editingId ?? `ob_${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`,
         pointId,
         date: values.date,
@@ -128,17 +133,24 @@ export default function ObservationEntry() {
         createdAt: now,
         updatedAt: now
       })
+      message.success(
+        result.merged
+          ? '该测点该日已有观测记录，已沿原记录更正，后续累计与日速率已联动重算'
+          : editingId
+            ? '观测记录已更新，后续累计量与日速率已联动重算'
+            : '观测已录入，累计量与日速率已自动计算'
+      )
     } catch (error) {
       message.error(`观测保存失败：${error instanceof Error ? error.message : '未知错误'}`)
       return
     }
-    message.success(editingId ? '观测记录已更新，累计量与日速率已重算' : '观测已录入，累计量与日速率已自动计算')
     setOpen(false)
   }
 
   const remove = async (row: ObservationRow): Promise<void> => {
-    await db.observations.delete(row.id)
-    message.success('观测记录已删除')
+    // 作废与更正同一口径：删除后联动重算该测点后续累计与日速率
+    await deleteObservation(row.id)
+    message.success('观测记录已作废，后续累计与日速率已联动重算')
   }
 
   const generateAlarm = async (): Promise<void> => {
@@ -150,11 +162,15 @@ export default function ObservationEntry() {
       message.info('请先点击「录入观测」并填写读数，越限后可生成预警单')
       return
     }
+    if (draftIsFuture) {
+      message.warning('未来日期的观测仅存档，不进入当前预警')
+      return
+    }
     if (preview.level === null) {
       message.info('当前读数未越限，无需生成预警单')
       return
     }
-    const result = alarmLevel.buildDraft(activePoint, draftDate || new Date().toISOString().slice(0, 10), Number(draftReading))
+    const result = alarmLevel.buildDraft(activePoint, draftDate || todayString(), Number(draftReading))
     if (!result) return
     await alarmStore.createAlarm({ ...result.draft, measure: result.basis })
     message.success(`已生成${result.draft.level}色预警单`)
@@ -237,10 +253,11 @@ export default function ObservationEntry() {
             <EmptyPanel title="没有可录入的测点" description="先到测点配置页布设测点与阈值。" compact />
           ) : (
             candidates.map((point: Point) => {
-              const latest = observationTable.rows
-                .filter((row) => row.pointId === point.id)
-                .sort((a, b) => b.date.localeCompare(a.date))[0]
-              const level = latest ? alarmLevel.evaluate(point, latest.reading).level : null
+              const ownRows = observationTable.rows.filter((row) => row.pointId === point.id)
+              const latest = [...ownRows].sort((a, b) => b.date.localeCompare(a.date))[0]
+              // 当前预警级别只看截至今天的有效观测，未来日期的记录不参与
+              const effective = latestEffectiveObservation(ownRows)
+              const level = effective ? alarmLevel.evaluate(point, effective.reading).level : null
               return (
                 <div
                   key={point.id}
@@ -254,10 +271,13 @@ export default function ObservationEntry() {
                   <div className="card-list-item__meta">
                     <span>{point.type}</span>
                     <span>· 阈值 {point.threshold} {point.unit}</span>
-                    <span>· 观测 {observationTable.rows.filter((row) => row.pointId === point.id).length} 次</span>
+                    <span>· 观测 {ownRows.length} 次</span>
                   </div>
                   <div className="card-list-item__meta">
-                    <span>最新：{latest ? `${latest.date} ${latest.reading.toFixed(3)} ${point.unit}` : '暂无观测'}</span>
+                    <span>
+                      最新：{latest ? `${latest.date} ${latest.reading.toFixed(3)} ${point.unit}` : '暂无观测'}
+                      {latest && isFutureDate(latest.date) ? '（未来，不入预警）' : ''}
+                    </span>
                   </div>
                 </div>
               )
@@ -317,8 +337,8 @@ export default function ObservationEntry() {
         footer={
           <Space>
             <Button onClick={() => setOpen(false)}>取消</Button>
-            {/* 读数草稿只在弹窗内存在，因此越限生成预警单必须与读数同屏可用 */}
-            <Button onClick={generateAlarm} disabled={!preview || preview.level === null}>
+            {/* 读数草稿只在弹窗内存在，因此越限生成预警单必须与读数同屏可用；未来日期仅存档，不入当前预警 */}
+            <Button onClick={generateAlarm} disabled={!preview || preview.level === null || draftIsFuture}>
               生成预警单
             </Button>
             <Button type="primary" onClick={submit}>
@@ -347,6 +367,7 @@ export default function ObservationEntry() {
                 累计变化 {preview.cumulative.toFixed(3)} · 占阈值 {(preview.ratio * 100).toFixed(1)}%
               </span>
               {preview.level ? <AlarmTag level={preview.level} /> : <Tag color="green">正常</Tag>}
+              {draftIsFuture ? <Tag>未来日期，不入当前预警</Tag> : null}
             </div>
           ) : null}
         </Form>

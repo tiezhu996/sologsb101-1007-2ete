@@ -8,7 +8,7 @@ export interface Alarm {
   /** 冗余坝体 id，便于按坝体筛选 */
   damId: string
   level: AlarmLevel
-  /** 触发值（累计变化量） */
+  /** 触发值（累计变化量）；进入处置流程后保留原触发值，不随观测更正回写 */
   triggerValue: number
   triggerDate: string
   state: AlarmState

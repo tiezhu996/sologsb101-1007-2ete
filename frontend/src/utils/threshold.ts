@@ -37,6 +37,32 @@ export function daysBetween(from: string, to: string): number {
   return days > 0 ? days : 1
 }
 
+/** 今天日期串 YYYY-MM-DD（与观测录入的默认日期同一口径） */
+export function todayString(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+/** 是否未来日期（晚于今天）：未来观测仅存档，不进入当前预警 */
+export function isFutureDate(date: string, today: string = todayString()): boolean {
+  return date > today
+}
+
+/**
+ * 截至今天（含）的最新一条观测
+ * 未来日期的观测可以保存，但不参与当前预警判定与预警单生成
+ */
+export function latestEffectiveObservation<T extends { date: string }>(
+  observations: T[],
+  today: string = todayString()
+): T | null {
+  let latest: T | null = null
+  for (const row of observations) {
+    if (row.date > today) continue
+    if (latest === null || row.date > latest.date) latest = row
+  }
+  return latest
+}
+
 /** 累计变化量 = 读数 − 初值 */
 export function cumulativeOf(reading: number, initialValue: number): number {
   return round(reading - initialValue, 3)
