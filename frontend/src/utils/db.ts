@@ -363,45 +363,104 @@ export async function resetDatabase(): Promise<void> {
   await seedDatabase()
 }
 
-/** 观测录入：写入累计变化量与日速率 */
-export async function putObservation(
-  row: Omit<Observation, 'cumulative' | 'dailyRate'> & { cumulative?: number; dailyRate?: number }
-): Promise<ObservationRow> {
-  const point = await db.points.get(row.pointId)
-  const initialValue = point ? point.initialValue : 0
-  const others = (await db.observations.where('pointId').equals(row.pointId).toArray())
-    .filter((item) => item.id !== row.id)
-    .sort((a, b) => a.date.localeCompare(b.date))
-  const previous = others.filter((item) => item.date < row.date).pop() ?? null
-  const cumulative = cumulativeOf(row.reading, initialValue)
-  const dailyRate = previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0
-  const next: ObservationRow = {
-    ...row,
-    cumulative,
-    dailyRate,
-    revision: ROW_REVISION
-  }
-  await db.observations.put(next)
-  return next
+export interface PutObservationResult {
+  row: ObservationRow
+  /** 是否沿用了当日已有记录更正（同测点同日只保留一条） */
+  merged: boolean
 }
 
-/** 重算某测点全部观测的累计变化量与日速率 */
+/**
+ * 重算核心：同一测点同一日只保留最早建档的一条，再按日期升序重算累计变化量与日速率。
+ * 只写 observations 表——已生成（含处置中）的预警单保留原触发值，不随观测更正改写。
+ * 须在 observations 表可写事务内调用。
+ */
+async function recalculatePointObservations(pointId: string, initialValue: number): Promise<void> {
+  const rows = (await db.observations.where('pointId').equals(pointId).toArray()).sort(
+    (a, b) => a.date.localeCompare(b.date) || a.createdAt - b.createdAt || a.id.localeCompare(b.id)
+  )
+  // 同一日算一条：同日重复行只保留最早建档的一条，其余作废（清理历史遗留重复）
+  const seenDates = new Set<string>()
+  const kept: ObservationRow[] = []
+  const duplicateIds: string[] = []
+  rows.forEach((row) => {
+    if (seenDates.has(row.date)) duplicateIds.push(row.id)
+    else {
+      seenDates.add(row.date)
+      kept.push(row)
+    }
+  })
+  if (duplicateIds.length > 0) await db.observations.bulkDelete(duplicateIds)
+  const patches = kept
+    .map((row, index) => {
+      const previous = index === 0 ? null : kept[index - 1]
+      const cumulative = cumulativeOf(row.reading, initialValue)
+      const dailyRate = previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0
+      if (row.cumulative === cumulative && row.dailyRate === dailyRate) return null
+      return { ...row, cumulative, dailyRate, updatedAt: Date.now() }
+    })
+    .filter((item): item is ObservationRow => item !== null)
+  if (patches.length > 0) await db.observations.bulkPut(patches)
+}
+
+/**
+ * 观测录入 / 补录 / 更正：以观测记录为唯一依据，同一测点同一日只保留一条。
+ * - 当日已有记录时沿用最早建档的一条更正（保留其 id 与 createdAt），其余同日重复行作废，
+ *   避免曲线出现重复日期、累计量与日速率被多算；
+ * - 写入后重算该测点全部观测，较早日期的更正带动后续累计量与日速率
+ *   （速率排行、占阈值比与预警草稿由 liveQuery 回流实时重算）。
+ */
+export async function putObservation(
+  row: Omit<Observation, 'cumulative' | 'dailyRate'> & { cumulative?: number; dailyRate?: number }
+): Promise<PutObservationResult> {
+  const point = await db.points.get(row.pointId)
+  const initialValue = point ? point.initialValue : 0
+  const outcome = await db.transaction('rw', db.observations, async () => {
+    const siblings = await db.observations.where('pointId').equals(row.pointId).toArray()
+    const sameDay = siblings
+      .filter((item) => item.date === row.date)
+      .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
+    // 沿用当日最早建档的记录更正；其余同日行（含编辑改期后腾空的原行）一并作废
+    const keeper = sameDay[0] ?? null
+    const obsoleteIds = sameDay.slice(1).map((item) => item.id)
+    const selfExists = siblings.some((item) => item.id === row.id)
+    if (keeper && keeper.id !== row.id && selfExists) obsoleteIds.push(row.id)
+    if (obsoleteIds.length > 0) await db.observations.bulkDelete(obsoleteIds)
+
+    const next: ObservationRow = {
+      ...row,
+      id: keeper ? keeper.id : row.id,
+      createdAt: keeper ? keeper.createdAt : row.createdAt,
+      cumulative: 0,
+      dailyRate: 0,
+      updatedAt: Date.now(),
+      revision: ROW_REVISION
+    }
+    await db.observations.put(next)
+    await recalculatePointObservations(row.pointId, initialValue)
+    return { id: next.id, merged: keeper !== null && keeper.id !== row.id }
+  })
+  const saved = await db.observations.get(outcome.id)
+  if (!saved) throw new Error('观测记录写入后读取失败')
+  return { row: saved, merged: outcome.merged }
+}
+
+/** 作废观测记录：与更正同一口径，删除后重算该测点后续累计变化量与日速率 */
+export async function deleteObservation(id: string): Promise<void> {
+  const row = await db.observations.get(id)
+  if (!row) return
+  const point = await db.points.get(row.pointId)
+  const initialValue = point ? point.initialValue : 0
+  await db.transaction('rw', db.observations, async () => {
+    await db.observations.delete(id)
+    await recalculatePointObservations(row.pointId, initialValue)
+  })
+}
+
+/** 重算某测点全部观测的累计变化量与日速率（同日去重口径与录入一致） */
 export async function recalculateObservations(pointId: string): Promise<void> {
   const point = await db.points.get(pointId)
   const initialValue = point ? point.initialValue : 0
-  const rows = (await db.observations.where('pointId').equals(pointId).toArray()).sort((a, b) =>
-    a.date.localeCompare(b.date)
-  )
-  const patches = rows.map((row, index) => {
-    const previous = index === 0 ? null : rows[index - 1]
-    return {
-      ...row,
-      cumulative: cumulativeOf(row.reading, initialValue),
-      dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0,
-      updatedAt: Date.now()
-    }
-  })
-  if (patches.length > 0) await db.observations.bulkPut(patches)
+  await db.transaction('rw', db.observations, () => recalculatePointObservations(pointId, initialValue))
 }
 
 /* ============================ 本地 UI 偏好 ============================ */

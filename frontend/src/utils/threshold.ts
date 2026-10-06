@@ -37,6 +37,19 @@ export function daysBetween(from: string, to: string): number {
   return days > 0 ? days : 1
 }
 
+/** 本地今日日期 YYYY-MM-DD */
+export function todayString(): string {
+  const now = new Date()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${now.getFullYear()}-${month}-${day}`
+}
+
+/** 是否未来日期（晚于本地今日）：未来观测允许存档，但不进入当前预警 */
+export function isFutureDate(date: string): boolean {
+  return date.length > 0 && date > todayString()
+}
+
 /** 累计变化量 = 读数 − 初值 */
 export function cumulativeOf(reading: number, initialValue: number): number {
   return round(reading - initialValue, 3)

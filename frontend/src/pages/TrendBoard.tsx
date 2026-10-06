@@ -29,7 +29,7 @@ import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
-import { formatRate, formatReading, ratioOf } from '@/utils/threshold'
+import { formatRate, formatReading, isFutureDate, ratioOf } from '@/utils/threshold'
 
 interface TrendRow {
   point: Point
@@ -131,6 +131,11 @@ export default function TrendBoard() {
   const drawerLevel = drawerPoint && drawerLatest ? alarmLevel.evaluate(drawerPoint, drawerLatest.reading).level : null
 
   const generateAlarm = async (point: Point, observation: ObservationRow): Promise<void> => {
+    // 未来日期的观测允许存档，但不进入当前预警
+    if (isFutureDate(observation.date)) {
+      message.warning('未来日期的观测仅存档，不进入当前预警')
+      return
+    }
     if (alarmStore.alarms.some((alarm) => alarm.pointId === point.id && alarm.triggerDate === observation.date)) {
       message.info('该测点当日已生成预警单')
       return

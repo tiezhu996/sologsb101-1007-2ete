@@ -15,7 +15,8 @@ import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, putObservation, type ObservationRow } from '@/utils/db'
+import { db, deleteObservation, putObservation, type ObservationRow } from '@/utils/db'
+import { isFutureDate, todayString } from '@/utils/threshold'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
 import type { ObservationDraft } from '@/types/observation'
 
@@ -90,7 +91,7 @@ export default function ObservationEntry() {
     const latest = observationsOfActive[0]
     form.setFieldsValue({
       pointId: activePoint.id,
-      date: new Date().toISOString().slice(0, 10),
+      date: todayString(),
       reading: latest ? latest.reading : activePoint.initialValue,
       observer: ''
     })
@@ -118,8 +119,9 @@ export default function ObservationEntry() {
       return
     }
     const now = Date.now()
+    let merged = false
     try {
-      await putObservation({
+      const result = await putObservation({
         id: editingId ?? `ob_${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`,
         pointId,
         date: values.date,
@@ -128,17 +130,24 @@ export default function ObservationEntry() {
         createdAt: now,
         updatedAt: now
       })
+      merged = result.merged
     } catch (error) {
       message.error(`观测保存失败：${error instanceof Error ? error.message : '未知错误'}`)
       return
     }
-    message.success(editingId ? '观测记录已更新，累计量与日速率已重算' : '观测已录入，累计量与日速率已自动计算')
+    message.success(
+      merged
+        ? '当日已有观测记录，已沿用原记录更正，后续累计量与日速率已重算'
+        : editingId
+          ? '观测记录已更新，后续累计量与日速率已重算'
+          : '观测已录入，累计量与日速率已自动计算'
+    )
     setOpen(false)
   }
 
   const remove = async (row: ObservationRow): Promise<void> => {
-    await db.observations.delete(row.id)
-    message.success('观测记录已删除')
+    await deleteObservation(row.id)
+    message.success('观测记录已作废，后续累计量与日速率已重算')
   }
 
   const generateAlarm = async (): Promise<void> => {
@@ -154,7 +163,13 @@ export default function ObservationEntry() {
       message.info('当前读数未越限，无需生成预警单')
       return
     }
-    const result = alarmLevel.buildDraft(activePoint, draftDate || new Date().toISOString().slice(0, 10), Number(draftReading))
+    // 未来日期的观测允许存档，但不进入当前预警
+    const date = draftDate || todayString()
+    if (isFutureDate(date)) {
+      message.warning('未来日期的观测仅存档，不进入当前预警')
+      return
+    }
+    const result = alarmLevel.buildDraft(activePoint, date, Number(draftReading))
     if (!result) return
     await alarmStore.createAlarm({ ...result.draft, measure: result.basis })
     message.success(`已生成${result.draft.level}色预警单`)
@@ -189,9 +204,13 @@ export default function ObservationEntry() {
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title="确认删除该观测记录？" onConfirm={() => remove(record)}>
+          <Popconfirm
+            title="确认作废该观测记录？"
+            description="作废后该测点后续累计量与日速率将重算"
+            onConfirm={() => remove(record)}
+          >
             <Button type="link" size="small" danger>
-              删除
+              作废
             </Button>
           </Popconfirm>
         </Space>
@@ -342,11 +361,12 @@ export default function ObservationEntry() {
             <Input placeholder="如 刘振国" />
           </Form.Item>
           {preview ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <span className="muted">
                 累计变化 {preview.cumulative.toFixed(3)} · 占阈值 {(preview.ratio * 100).toFixed(1)}%
               </span>
               {preview.level ? <AlarmTag level={preview.level} /> : <Tag color="green">正常</Tag>}
+              {draftDate && isFutureDate(draftDate) ? <Tag color="orange">未来日期，仅存档不进入当前预警</Tag> : null}
             </div>
           ) : null}
         </Form>
